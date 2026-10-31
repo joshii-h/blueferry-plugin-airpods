@@ -67,7 +67,10 @@ _MODELS = (
     Model(0x2013, "AirPods 3", "AirPods-3"),
     Model(0x2019, "AirPods 4", "AirPods-4"),
     Model(0x201B, "AirPods 4 (ANC)", "AirPods-4-ANC"),
-    # Named so by AirPodsDesktop; no other decoder lists them yet.
+    # Unconfirmed: only AirPodsDesktop maps these ids to "AirPods 5"
+    # (SpriteOvO/AirPodsDesktop commit 71fbb5e, 2026-09-19,
+    # Source/Core/AppleCP.cpp, from captured packets); no Apple source and
+    # no second decoder confirm them yet.
     Model(0x2030, "AirPods 5", "AirPods-5"),
     Model(0x2036, "AirPods 5", "AirPods-5"),
     Model(0x200E, "AirPods Pro", "AirPods-Pro"),
