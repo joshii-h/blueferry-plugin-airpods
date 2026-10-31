@@ -168,7 +168,7 @@ class AirPodsService(CardService):
             self._paired_known = True
             choice = self._choice
         self.tracker.configure(nearby=self.tracker.nearby, wanted=wanted_models(models, choice))
-        self._maybe_changed(force=True)
+        self._maybe_changed()
 
     def _set_state(self, state: str) -> None:
         with self._lock:
@@ -176,7 +176,7 @@ class AirPodsService(CardService):
                 return
             self._state = state
         log.info("bluetooth state: %s", state)
-        self._maybe_changed(force=True)
+        self._maybe_changed()
 
     def _maybe_changed(self, *, force: bool = False) -> None:
         """Emit CardChanged and Changed when what the user sees changed."""
