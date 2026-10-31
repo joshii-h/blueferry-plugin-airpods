@@ -4,6 +4,9 @@
 (``GetManagedObjects``, ``RegisterMonitor``, ``GetAll`` …) from a dict of
 BlueZ objects, and lets a test emit BlueZ's signals. Nothing touches a real
 bus. Replies are delivered at once, like a main loop that runs them next.
+Like the real ones, it refuses a second object at an exported path
+(dbus-python's ``KeyError``) and a second registration of the same
+application (BlueZ's ``AlreadyExists``, also across power cycles).
 """
 from __future__ import annotations
 
@@ -44,7 +47,22 @@ class FakeSystemBus:
         self.receivers: list[tuple] = []
         self.calls: list[tuple[str, str, str]] = []
         self.registered: list[str] = []
+        self.exported: dict[str, Any] = {}
         self.fail_register = False
+
+    # ---- what dbus.service.Object calls when exported ----------------------------
+
+    def _register_object_path(self, path, on_message, on_unregister=None,
+                              fallback=False) -> None:
+        if path in self.exported:
+            raise KeyError(f"Can't register the object-path handler for {path!r}: "
+                           "there is already a handler")
+        self.exported[path] = on_message
+
+    def _unregister_object_path(self, path) -> None:
+        if path not in self.exported:
+            raise LookupError(path)
+        del self.exported[path]
 
     # ---- what the watcher calls ------------------------------------------------
 
@@ -68,9 +86,17 @@ class FakeSystemBus:
                 error(dbus.exceptions.DBusException(
                     "nope", name="org.bluez.Error.Failed"))
                 return
+            if str(args[0]) in self.registered:
+                error(dbus.exceptions.DBusException(
+                    "Already Exists", name="org.bluez.Error.AlreadyExists"))
+                return
             self.registered.append(str(args[0]))
             reply()
         elif (interface, method) == (MONITOR_MANAGER, "UnregisterMonitor"):
+            if str(args[0]) not in self.registered:
+                error(dbus.exceptions.DBusException(
+                    "Does Not Exist", name="org.bluez.Error.DoesNotExist"))
+                return
             self.registered.remove(str(args[0]))
             reply()
         elif (interface, method) == (PROPERTIES, "GetAll"):
@@ -88,6 +114,12 @@ class FakeSystemBus:
                 handler(*args, path=path)
             else:
                 handler(*args)
+
+    def power(self, on: bool) -> None:
+        """Switch the adapter; BlueZ keeps registered monitors meanwhile."""
+        self.objects[ADAPTER_PATH][ADAPTER]["Powered"] = dbus.Boolean(on)
+        self.emit("PropertiesChanged", ADAPTER, {"Powered": dbus.Boolean(on)}, [],
+                  path=ADAPTER_PATH)
 
     def add_device(self, path: str, **properties: Any) -> None:
         self.objects[path] = {DEVICE: properties}
@@ -115,6 +147,23 @@ def sighting(name: str = "pro2_left_in_ear", *, path: str = "/org/bluez/hci0/dev
              rssi: int | None = -50, paired: bool = False, at: float = 100.0) -> Sighting:
     return Sighting(path=path, data=payload(THEENGS[name]), rssi=rssi, paired=paired,
                     seen_at=at)
+
+
+class Timers:
+    """Collects GLib-style timeouts; ``fire()`` runs the due ones."""
+
+    def __init__(self) -> None:
+        self.pending: list[tuple[int, Any]] = []
+
+    def __call__(self, seconds: int, callback) -> object:
+        self.pending.append((seconds, callback))
+        return len(self.pending)
+
+    def fire(self) -> list[int]:
+        due, self.pending = self.pending, []
+        for _seconds, callback in due:
+            callback()
+        return [seconds for seconds, _callback in due]
 
 
 class Clock:

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import dbus
 import pytest
-from fakes import ADAPTER_PATH, FakeSystemBus, paired_airpods
+from fakes import ADAPTER_PATH, FakeSystemBus, Timers, paired_airpods
 from samples import THEENGS
 
 from blueferry_airpods.bluez import (
@@ -12,6 +12,7 @@ from blueferry_airpods.bluez import (
     MAX_DEVICES,
     MONITOR,
     MONITOR_MANAGER,
+    PROPERTIES,
     BluezWatcher,
     apple_payload,
     paired_model,
@@ -25,11 +26,18 @@ class Recorder:
         self.states: list[str] = []
 
 
-def watcher(bus: FakeSystemBus) -> tuple[BluezWatcher, Recorder]:
+def watcher(bus: FakeSystemBus, timers: Timers | None = None) -> tuple[BluezWatcher, Recorder]:
     seen = Recorder()
     w = BluezWatcher(bus, seen.sightings.append, seen.paired.append, seen.states.append,
-                     clock=lambda: 5.0)
+                     clock=lambda: 5.0, timer=timers if timers is not None else Timers())
     return w, seen
+
+
+APP = "/io/weirdware/blueferry/airpods"
+
+
+def methods(bus: FakeSystemBus, name: str) -> int:
+    return sum(1 for _path, _interface, method in bus.calls if method == name)
 
 
 def test_registers_an_apple_proximity_monitor() -> None:
@@ -66,6 +74,125 @@ def test_stop_unregisters_and_removes_the_match_rules() -> None:
     w.stop()
     assert bus.registered == [] and bus.receivers == []
     assert seen.states[-1] == "stopped"
+
+
+def test_stop_takes_the_objects_off_the_bus_for_the_next_watcher() -> None:
+    # dbus.SystemBus() is one connection per process: the watcher after a
+    # stop exports at the same path.
+    bus = FakeSystemBus()
+    first, _seen = watcher(bus)
+    first.start()
+    assert set(bus.exported) == {APP, APP + "/monitor0"}
+    first.stop()
+    assert bus.exported == {} and first._app is None and first._monitor is None
+    second, seen = watcher(bus)
+    second.start()
+    assert seen.states[-1] == "monitoring" and bus.registered == [APP]
+    assert set(bus.exported) == {APP, APP + "/monitor0"}
+
+
+def test_a_taken_path_falls_back_to_listening() -> None:
+    bus = FakeSystemBus()
+    first, _seen = watcher(bus)
+    first.start()
+    second, seen = watcher(bus)
+    second.start()
+    assert seen.states[-1] == "listening" and methods(bus, "RegisterMonitor") == 1
+
+
+def test_a_power_cycle_keeps_the_registration() -> None:
+    bus = FakeSystemBus()
+    w, seen = watcher(bus)
+    w.start()
+    bus.power(False)
+    assert seen.states[-1] == "powered-off"
+    bus.power(True)
+    assert seen.states[-1] == "monitoring"
+    assert bus.registered == [APP] and methods(bus, "RegisterMonitor") == 1
+
+
+def test_already_exists_means_registered() -> None:
+    bus = FakeSystemBus()
+    bus.registered.append(APP)              # BlueZ still holds the application
+    w, seen = watcher(bus)
+    w.start()
+    assert seen.states[-1] == "monitoring" and bus.registered == [APP]
+
+
+def test_after_a_release_it_registers_again_later() -> None:
+    bus = FakeSystemBus()
+    timers = Timers()
+    w, seen = watcher(bus, timers)
+    w.start()
+    w._monitor.Release()
+    assert seen.states[-1] == "listening"
+    assert timers.fire() == [5]
+    # The application BlueZ may still hold goes first, then a fresh one.
+    assert [m for _p, _i, m in bus.calls][-3:] == [
+        "GetManagedObjects", "UnregisterMonitor", "RegisterMonitor"]
+    assert seen.states[-1] == "monitoring" and bus.registered == [APP]
+    assert timers.pending == []
+
+
+def test_failed_registrations_retry_with_a_growing_pause() -> None:
+    bus = FakeSystemBus()
+    bus.fail_register = True
+    timers = Timers()
+    w, seen = watcher(bus, timers)
+    w.start()
+    assert seen.states[-1] == "listening"
+    assert timers.fire() == [5]
+    assert timers.fire() == [10]
+    bus.fail_register = False
+    assert timers.fire() == [20]
+    assert seen.states[-1] == "monitoring" and timers.pending == []
+
+
+def test_a_stopped_watcher_ignores_its_retry() -> None:
+    bus = FakeSystemBus()
+    bus.fail_register = True
+    timers = Timers()
+    w, _seen = watcher(bus, timers)
+    w.start()
+    w.stop()
+    calls = len(bus.calls)
+    timers.fire()
+    assert len(bus.calls) == calls
+
+
+def test_a_powered_adapter_wins() -> None:
+    bus = FakeSystemBus(powered=False)
+    bus.objects["/org/bluez/hci1"] = {ADAPTER: {"Powered": dbus.Boolean(True)},
+                                     MONITOR_MANAGER: {}}
+    w, seen = watcher(bus)
+    w.start()
+    assert seen.states[-1] == "monitoring"
+    assert ("/org/bluez/hci1", MONITOR_MANAGER, "RegisterMonitor") in bus.calls
+
+
+def test_scanning_switched_off_and_on() -> None:
+    bus = FakeSystemBus()
+    w, seen = watcher(bus)
+    w.start()
+    w.set_scanning(False)
+    assert seen.states[-1] == "idle" and bus.registered == []
+    bus.advert("/org/bluez/hci0/dev_A", THEENGS["pro2_left_in_ear"])
+    assert seen.sightings == []
+    # Pairing is still followed while idle.
+    paired_airpods(bus, "/org/bluez/hci0/dev_P", 0x2024)
+    bus.emit("PropertiesChanged", DEVICE, {"Paired": dbus.Boolean(True)}, [],
+             path="/org/bluez/hci0/dev_P")
+    assert seen.paired[-1] == {0x2024} and seen.states[-1] == "idle"
+    w.set_scanning(True)
+    assert seen.states[-1] == "monitoring" and bus.registered == [APP]
+
+
+def test_started_without_scanning_never_registers() -> None:
+    bus = FakeSystemBus()
+    w, seen = watcher(bus)
+    w.set_scanning(False)
+    w.start()
+    assert seen.states[-1] == "idle" and methods(bus, "RegisterMonitor") == 0
 
 
 def test_adverts_become_sightings() -> None:
@@ -119,6 +246,23 @@ def test_device_found_reads_the_device() -> None:
     w._monitor.DeviceFound("/elsewhere/dev")       # not BlueZ's: ignored
     (s,) = seen.sightings
     assert s.path == path and s.rssi == -58
+
+
+def test_device_found_again_needs_no_round_trip() -> None:
+    bus = FakeSystemBus()
+    path = "/org/bluez/hci0/dev_F"
+    bus.add_device(path, RSSI=dbus.Int16(-58), ManufacturerData={
+        dbus.UInt16(0x004C): dbus.Array(
+            [dbus.Byte(b) for b in bytes.fromhex(THEENGS["max_green"])[2:]], signature="y")})
+    bus.add_device("/org/bluez/hci0/dev_G", RSSI=dbus.Int16(-40))     # no proximity data
+    w, seen = watcher(bus)
+    w.start()
+    for _advert in range(5):
+        w._monitor.DeviceFound(path)
+        w._monitor.DeviceFound("/org/bluez/hci0/dev_G")
+    get_all = [c for c in bus.calls if c[1:] == (PROPERTIES, "GetAll")]
+    assert len(get_all) == 2
+    assert [(s.path, s.rssi) for s in seen.sightings] == [(path, -58)] * 5
 
 
 def test_paired_models_come_from_the_modalias() -> None:
@@ -215,10 +359,14 @@ def test_bluez_restart_registers_again() -> None:
 
 def test_released_monitor_means_listening() -> None:
     bus = FakeSystemBus()
-    w, seen = watcher(bus)
+    timers = Timers()
+    w, seen = watcher(bus, timers)
     w.start()
     w._monitor.Release()
-    assert seen.states[-1] == "listening"
+    assert seen.states[-1] == "listening" and len(timers.pending) == 1
+    w.stop()
+    timers.fire()
+    assert seen.states[-1] == "stopped"
 
 
 def test_the_device_cache_stays_small() -> None:

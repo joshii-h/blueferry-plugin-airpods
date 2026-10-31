@@ -8,6 +8,10 @@ Proximity Pairing type: AD type 0xFF, bytes ``4C 00 07``. The plugin
 never starts discovery and never connects to anything; it reads
 ``ManufacturerData`` and ``RSSI`` of the devices BlueZ reports.
 
+BlueZ keeps a registered monitor across adapter power cycles, so the
+watcher registers once per BlueZ instance; when BlueZ releases the monitor
+it registers again after a growing pause.
+
 Without the monitor manager (older BlueZ, adapter without support) the
 watcher still listens to ``PropertiesChanged``; it then sees adverts only
 while another program runs a discovery.
@@ -27,7 +31,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import dbus
-import dbus.connection
 import dbus.service
 
 from blueferry_airpods.proximity import APPLE_COMPANY_ID, PROXIMITY_TYPE
@@ -47,6 +50,19 @@ PATTERN = bytes([APPLE_COMPANY_ID & 0xFF, APPLE_COMPANY_ID >> 8, PROXIMITY_TYPE]
 #: Devices remembered at once; strangers come and go, the cache stays small.
 MAX_DEVICES = 128
 MODALIAS = re.compile(r"^bluetooth:v004Cp([0-9A-Fa-f]{4})", re.ASCII)
+#: BlueZ's answer to registering an application it still holds.
+ALREADY_EXISTS = "org.bluez.Error.AlreadyExists"
+#: Pause before registering again after a release or failure: doubles from
+#: the first value up to the second (seconds).
+RETRY_FIRST, RETRY_MAX = 5, 300
+
+Timer = Callable[[int, Callable[[], bool]], object]
+
+
+def _timeout(seconds: int, callback: Callable[[], bool]) -> object:
+    from gi.repository import GLib
+
+    return GLib.timeout_add_seconds(seconds, callback)
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,8 +118,8 @@ def _rssi(value: Any) -> int | None:
 class MonitorApplication(dbus.service.Object):
     """The ObjectManager root BlueZ reads the monitor from."""
 
-    def __init__(self, bus: Any, path: str, monitor: Monitor) -> None:
-        super().__init__(bus, path) if bus is not None else super().__init__()
+    def __init__(self, monitor: Monitor) -> None:
+        super().__init__()
         self.monitor = monitor
 
     @dbus.service.method(OBJECT_MANAGER, out_signature="a{oa{sa{sv}}}")
@@ -114,8 +130,8 @@ class MonitorApplication(dbus.service.Object):
 class Monitor(dbus.service.Object):
     """``org.bluez.AdvertisementMonitor1``: Apple Proximity Pairing only."""
 
-    def __init__(self, bus: Any, path: str, watcher: BluezWatcher) -> None:
-        super().__init__(bus, path) if bus is not None else super().__init__()
+    def __init__(self, path: str, watcher: BluezWatcher) -> None:
+        super().__init__()
         self.path = path
         self.watcher = watcher
 
@@ -162,8 +178,10 @@ class BluezWatcher:
 
     All callbacks run on the main loop. ``state`` is one of ``starting``,
     ``monitoring`` (passive scan through the monitor), ``listening`` (no
-    monitor support: only while someone else scans), ``no-adapter``,
-    ``powered-off``, ``unavailable`` (BlueZ not on the bus) or ``stopped``.
+    monitor support: only while someone else scans), ``idle`` (scanning
+    switched off with :meth:`set_scanning`: nothing to look for),
+    ``no-adapter``, ``powered-off``, ``unavailable`` (BlueZ not on the bus)
+    or ``stopped``.
     """
 
     def __init__(
@@ -175,18 +193,26 @@ class BluezWatcher:
         *,
         app_path: str = "/io/weirdware/blueferry/airpods",
         clock: Callable[[], float] = time.monotonic,
+        timer: Timer = _timeout,
     ) -> None:
         self.bus = bus
         self._on_sighting = on_sighting
         self._on_paired = on_paired
         self._on_state = on_state
         self._clock = clock
+        self._timer = timer
         self.app_path = app_path
         self.state = "stopped"
         self._adapter: str | None = None
         self._registered = False
+        self._registered_adapter: str | None = None
         self._registering = False
+        self._released = False      # BlueZ may still hold the app: unregister first
         self._wanted = False
+        self._scan = True
+        self._retries = 0
+        self._retry_pending = False
+        self._generation = 0        # outdated retry timers see a newer value
         self._paired: dict[str, int] = {}           # path -> product id
         self._paired_known = False
         self._powered: dict[str, bool] = {}         # adapter path -> Powered
@@ -202,6 +228,7 @@ class BluezWatcher:
         if self._matches:
             return
         self._wanted = True
+        self._generation += 1
         self._set_state("starting")
         self._matches = [
             self.bus.add_signal_receiver(
@@ -222,8 +249,11 @@ class BluezWatcher:
         self.refresh()
 
     def stop(self) -> None:
-        """Unregister the monitor (asynchronously) and stop listening."""
+        """Unregister the monitor (asynchronously), take the objects off the
+        bus and stop listening."""
         self._wanted = False
+        self._generation += 1
+        self._retry_pending = False
         for match in self._matches:
             try:
                 match.remove()
@@ -231,8 +261,27 @@ class BluezWatcher:
                 pass
         self._matches = []
         self._unregister()
+        # dbus.SystemBus() is shared in the process: a later watcher exports
+        # its objects at the same path, which fails while these are there.
+        self._unexport()
         self._devices.clear()
         self._set_state("stopped")
+
+    def set_scanning(self, scan: bool) -> None:
+        """Scan only while there is something to look for. Paired devices
+        are followed either way."""
+        if scan == self._scan:
+            return
+        self._scan = scan
+        if not self._wanted:
+            return
+        if scan:
+            self.refresh()
+            return
+        self._unregister()
+        self._devices.clear()
+        if self.state in ("starting", "monitoring", "listening"):
+            self._set_state("idle")
 
     def refresh(self) -> None:
         """Read adapters and paired devices again (asynchronously)."""
@@ -250,6 +299,7 @@ class BluezWatcher:
     def _bluez_missing(self, error: Exception) -> None:
         log.info("BlueZ is not reachable: %s", type(error).__name__)
         self._registered = self._registering = False
+        self._registered_adapter = None
         self._set_state("unavailable")
 
     def _managed_objects(self, objects: Any) -> None:
@@ -273,10 +323,17 @@ class BluezWatcher:
             self._adapter = None
             self._set_state("no-adapter")
             return
-        chosen = (sorted(managers) or sorted(adapters))[0]
+        # A powered adapter first, then one with the monitor manager.
+        chosen = min(adapters, key=lambda path: (
+            not self._powered.get(path, False), path not in managers, path))
+        if self._registered and self._registered_adapter != chosen:
+            self._unregister()
         self._adapter = chosen
         if not self._powered.get(chosen, False):
             self._set_state("powered-off")
+            return
+        if not self._scan:
+            self._set_state("idle")
             return
         if chosen in managers:
             self._register(chosen)
@@ -291,7 +348,9 @@ class BluezWatcher:
             self._on_paired(self.paired_models)
 
     def _owner_changed(self, _name: str, _old: str, new: str) -> None:
-        self._registered = self._registering = False
+        # A new bluetoothd knows nothing of the old registration.
+        self._registered = self._registering = self._released = False
+        self._registered_adapter = None
         self._devices.clear()
         if not self._wanted:
             return
@@ -303,58 +362,136 @@ class BluezWatcher:
     # ---- monitor ------------------------------------------------------------------
 
     def _register(self, adapter: str) -> None:
-        if self._registered or self._registering:
-            if self._registered:
-                self._set_state("monitoring")
+        if self._registering:
             return
-        if self._app is None:
-            # Exported on a real connection only; tests drive the objects directly.
-            bus = self.bus if isinstance(self.bus, dbus.connection.Connection) else None
-            monitor_path = f"{self.app_path}/monitor0"
-            self._monitor = Monitor(bus, monitor_path, self)
-            self._app = MonitorApplication(bus, self.app_path, self._monitor)
+        if self._registered:
+            self._set_state("monitoring")
+            return
+        if not self._export():
+            self._set_state("listening")
+            return
         self._registering = True
 
         def done() -> None:
             self._registering = False
-            self._registered = True
-            if not self._wanted:      # stopped while the call ran
+            self._registered, self._registered_adapter = True, adapter
+            self._retries = 0
+            if not (self._wanted and self._scan):     # stopped while the call ran
                 self._unregister()
                 return
             self._set_state("monitoring")
 
         def failed(error: Exception) -> None:
+            if _error_name(error) == ALREADY_EXISTS:
+                # BlueZ still has our application (it keeps it across power
+                # cycles): the monitor is in place.
+                done()
+                return
             self._registering = False
             log.info("RegisterMonitor failed: %s", _error_name(error))
-            # Still useful: adverts arrive while someone else discovers.
-            self._set_state("listening")
+            if self._wanted and self._scan:
+                # Still useful: adverts arrive while someone else discovers.
+                self._set_state("listening")
+                self._schedule_retry()
 
-        self.bus.call_async(
-            BLUEZ, adapter, MONITOR_MANAGER, "RegisterMonitor", "o",
-            (dbus.ObjectPath(self.app_path),), done, failed, timeout=10,
-        )
+        def register(*_ignored: Any) -> None:
+            self.bus.call_async(
+                BLUEZ, adapter, MONITOR_MANAGER, "RegisterMonitor", "o",
+                (dbus.ObjectPath(self.app_path),), done, failed, timeout=10,
+            )
+
+        if self._released:
+            # After a release BlueZ may still hold the application without a
+            # monitor; registering it again would only say AlreadyExists.
+            self._released = False
+            self.bus.call_async(
+                BLUEZ, adapter, MONITOR_MANAGER, "UnregisterMonitor", "o",
+                (dbus.ObjectPath(self.app_path),), register, register, timeout=10,
+            )
+        else:
+            register()
 
     def _unregister(self) -> None:
-        if not self._registered or self._adapter is None:
+        if not self._registered or self._registered_adapter is None:
             return
-        self._registered = False
+        adapter = self._registered_adapter
+        self._registered, self._registered_adapter = False, None
         self.bus.call_async(
-            BLUEZ, self._adapter, MONITOR_MANAGER, "UnregisterMonitor", "o",
+            BLUEZ, adapter, MONITOR_MANAGER, "UnregisterMonitor", "o",
             (dbus.ObjectPath(self.app_path),), lambda: None,
             lambda error: log.info("UnregisterMonitor failed: %s", _error_name(error)),
             timeout=10,
         )
 
+    def _export(self) -> bool:
+        """Put the application and its monitor on the bus (once)."""
+        if self._app is not None:
+            return True
+        monitor = Monitor(f"{self.app_path}/monitor0", self)
+        app = MonitorApplication(monitor)
+        try:
+            monitor.add_to_connection(self.bus, monitor.path)
+            try:
+                app.add_to_connection(self.bus, self.app_path)
+            except Exception:
+                monitor.remove_from_connection()
+                raise
+        except (KeyError, ValueError) as error:
+            log.warning("cannot export the advertisement monitor: %s", error)
+            return False
+        self._monitor, self._app = monitor, app
+        return True
+
+    def _unexport(self) -> None:
+        for obj in (self._app, self._monitor):
+            if obj is None:
+                continue
+            try:
+                obj.remove_from_connection()
+            except LookupError:
+                pass
+        self._app = self._monitor = None
+
+    def _schedule_retry(self) -> None:
+        if self._retry_pending:
+            return
+        delay = min(RETRY_MAX, RETRY_FIRST * 2 ** min(self._retries, 8))
+        self._retries += 1
+        self._retry_pending = True
+        generation = self._generation
+
+        def retry() -> bool:
+            if generation == self._generation:
+                self._retry_pending = False
+                if self._wanted and self._scan:
+                    self.refresh()
+            return False
+
+        self._timer(delay, retry)
+
     def monitor_released(self) -> None:
-        self._registered = False
-        if self._wanted:
+        if self._registering:
+            return      # the old application, dropped by our own re-registration
+        self._registered, self._registered_adapter = False, None
+        self._released = True
+        if self._wanted and self._scan:
             self._set_state("listening")
+            self._schedule_retry()
 
     def monitor_active(self) -> None:
+        self._retries = 0
         self._set_state("monitoring")
 
     def device_found(self, path: str) -> None:
-        if not path.startswith("/org/bluez/"):
+        if not path.startswith("/org/bluez/") or not self._scan:
+            return
+        cached = self._devices.get(path)
+        if cached is not None:
+            # Without RSSI thresholds BlueZ calls this for every matching
+            # advert. Changed data and RSSI come as PropertiesChanged; here
+            # only "still there" is new, so no D-Bus round trip.
+            if cached[0] is not None:
+                self._update(path, cached[0], cached[1], report=True)
             return
         self.bus.call_async(
             BLUEZ, path, PROPERTIES, "GetAll", "s", (DEVICE,),
@@ -373,7 +510,8 @@ class BluezWatcher:
         path = str(path)
         if interface == ADAPTER and "Powered" in changed:
             self._powered[path] = bool(changed["Powered"])
-            self._registered = self._registering = False
+            # BlueZ keeps the monitor while the adapter is off: no new
+            # registration, refresh() only updates the state.
             if self._wanted:
                 self.refresh()
             return
@@ -381,6 +519,8 @@ class BluezWatcher:
             return
         if "Paired" in changed or "Modalias" in changed:
             self.refresh()
+        if not self._scan:
+            return
         has_data = "ManufacturerData" in changed
         data = apple_payload(changed["ManufacturerData"]) if has_data else None
         rssi = _rssi(changed.get("RSSI")) if "RSSI" in changed else None
@@ -403,6 +543,8 @@ class BluezWatcher:
             return
         if paired_model(device) is not None:
             self.refresh()
+        if not self._scan:
+            return
         data = apple_payload(device.get("ManufacturerData", {}))
         if data is not None:
             self._update(str(path), data, _rssi(device.get("RSSI")), report=True)
@@ -410,7 +552,8 @@ class BluezWatcher:
     def _interfaces_removed(self, path: str, interfaces: Any) -> None:
         path = str(path)
         if ADAPTER in interfaces:
-            self._registered = self._registering = False
+            if path == self._registered_adapter:
+                self._registered, self._registered_adapter = False, None
             self.refresh()
             return
         if DEVICE in interfaces:
