@@ -22,14 +22,12 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       # On a desktop dbus-python and PyGObject come from the distribution;
-      # here they are built for each Python against the system libraries
-      # (libsecret through its GObject introspection data).
+      # here they are built for each Python against the system libraries.
       - name: Install system libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libdbus-1-dev libglib2.0-dev libgirepository-2.0-dev libcairo2-dev \
-            gir1.2-secret-1 \
             pkg-config git
       - name: Create the environment
         run: |
