@@ -1,0 +1,30 @@
+[BlueFerry Plugin]
+Id=io.weirdware.blueferry.airpods
+Name=AirPods
+Version=0.1.0
+ApiVersion=1.5
+MinBlueFerry=0.8.1
+Capabilities=card;
+Homepage=https://github.com/joshii-h/blueferry-plugin-airpods
+Source=https://github.com/joshii-h/blueferry-plugin-airpods
+Exec=blueferry-airpods serve
+Cli=blueferry-airpods
+Alias=airpods
+
+[Config model]
+Label=My AirPods
+Type=choice
+Choices=paired;AirPods-1;AirPods-2;AirPods-3;AirPods-4;AirPods-4-ANC;AirPods-5;AirPods-Pro;AirPods-Pro-2;AirPods-Pro-3;AirPods-Max;Powerbeats-Pro;Beats-Fit-Pro;Beats-Flex;BeatsX;Powerbeats-3;Beats-Solo-3;Beats-Studio-3;
+Default=paired
+Group=options
+Help=paired: only AirPods paired with this computer. If they are paired with the iPhone only, pick the model once (iPhone: Settings > Bluetooth > (i) next to the AirPods); the closest of that model then count as yours.
+
+[Config nearby]
+Label=Nearby threshold (dBm)
+Type=int
+Min=-100
+Max=-30
+Default=-70
+Advanced=true
+ErrorText=Use -100 to -30 dBm.
+Help=How strong an advert must be to count as yours. Higher (e.g. -60) is stricter: only AirPods on your desk. Adverts BlueZ resolves to your paired AirPods always count.
