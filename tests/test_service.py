@@ -8,7 +8,7 @@ import pytest
 from blueferry.plugin_api.manifest import parse_manifest
 from blueferry.plugin_api.testing import inline_service
 from blueferry_plugin_kit.testing import FakeHost
-from fakes import Clock, FakeSystemBus, paired_airpods
+from fakes import Clock, FakeSystemBus, Timers, paired_airpods
 from samples import THEENGS
 
 from blueferry_airpods import manifest_text
@@ -27,13 +27,14 @@ class Env:
         if model is not None:
             self.store.save(Settings(model=model))
         self.clock = Clock()
+        self.timers = Timers()
         self.disabled = disabled
         self.watchers: list[BluezWatcher] = []
         self.changed = 0
 
         def factory(on_sighting, on_paired, on_state):
             watcher = BluezWatcher(self.bus, on_sighting, on_paired, on_state,
-                                   clock=self.clock)
+                                   clock=self.clock, timer=self.timers)
             self.watchers.append(watcher)
             return watcher
 
@@ -60,6 +61,26 @@ def test_unconfigured_card_explains_the_setup(tmp_path: Path) -> None:
     (item,) = env.host.card_items()
     assert item["id"] == "setup" and "Pair your AirPods" in item["subtitle"]
     assert env.service.status()["state"] == "unconfigured"
+
+
+def test_nothing_to_look_for_means_no_scan(tmp_path: Path) -> None:
+    env = Env(tmp_path)
+    assert env.bus.registered == [] and env.batteries()["state"] == "idle"
+    assert env.host.set_config({"model": "AirPods-Pro-2"}) == {"ok": True}
+    assert env.bus.registered == ["/io/weirdware/blueferry/airpods"]
+    assert env.batteries()["state"] == "monitoring"
+    assert env.host.set_config({"model": "paired"}) == {"ok": True}
+    assert env.bus.registered == [] and env.batteries()["state"] == "idle"
+
+
+def test_pairing_later_starts_the_scan(tmp_path: Path) -> None:
+    env = Env(tmp_path)
+    assert env.bus.registered == []
+    paired_airpods(env.bus, "/org/bluez/hci0/dev_P", 0x2014)
+    env.bus.emit("PropertiesChanged", "org.bluez.Device1", {"Paired": True}, [],
+                 path="/org/bluez/hci0/dev_P")
+    assert len(env.bus.registered) == 1
+    assert env.service.status()["detail"] == "Scanning passively for AirPods Pro 2"
 
 
 def test_strangers_never_reach_the_card_or_the_interface(tmp_path: Path) -> None:
@@ -179,6 +200,38 @@ def test_disabled_in_blueferry_stops_scanning(tmp_path: Path) -> None:
     env.service.last_activity = 0
     env.service.tick()
     assert env.service.last_activity == 0
+
+
+def test_enabled_again_scans_again(tmp_path: Path) -> None:
+    env = Env(tmp_path, model="AirPods-Pro-2")
+    env.disabled = True
+    env.service.tick()
+    assert env.bus.exported == {}
+    env.disabled = False
+    env.service.tick()
+    assert len(env.watchers) == 2 and env.watchers[-1].state == "monitoring"
+    assert len(env.bus.registered) == 1 and len(env.bus.exported) == 2
+    env.bus.advert(ADDRESS_PATH, THEENGS["pro2_left_in_ear"], rssi=-50)
+    assert [d["id"] for d in env.batteries()["devices"]] == ["airpods-2014"]
+
+
+def test_power_cycle_keeps_monitoring(tmp_path: Path) -> None:
+    env = Env(tmp_path, model="AirPods-Pro-2")
+    env.bus.power(False)
+    assert env.host.card_items()[0]["title"] == "Bluetooth is off"
+    env.bus.power(True)
+    assert env.batteries()["state"] == "monitoring" and len(env.bus.registered) == 1
+
+
+def test_polling_keeps_only_a_scanning_plugin_alive(tmp_path: Path) -> None:
+    env = Env(tmp_path, model="AirPods-Pro-2")
+    env.service.last_activity = 0
+    env.batteries()
+    assert env.service.last_activity == env.clock.now
+    idle = Env(tmp_path / "other")
+    idle.service.last_activity = 0
+    idle.batteries()
+    assert idle.service.last_activity == 0
 
 
 def test_started_while_disabled_never_scans(tmp_path: Path) -> None:

@@ -131,14 +131,13 @@ class AirPodsService(CardService):
     def tick(self) -> bool:
         """Every 30 s: follow BlueFerry's kill switch, expire, stay alive while watching."""
         if self._disabled():
-            if self._watcher is not None:
-                self._watcher.stop()
-                self._watcher = None
+            self.stop()
             self._set_state("disabled")
         elif self._watcher is None:
             self._watcher = self._watcher_factory(
                 self._sighting, self._paired_changed, self._set_state,
             )
+            self._watcher.set_scanning(self._watching())
             self._watcher.start()
         if self._watcher is not None and self._watching():
             # Adverts only arrive while the process runs: do not idle out.
@@ -148,13 +147,23 @@ class AirPodsService(CardService):
         return True
 
     def _watching(self) -> bool:
+        """Something to look for: your models, or not yet known what is paired."""
         with self._lock:
             return bool(self.tracker.wanted) or not self._paired_known
+
+    def _update_scanning(self) -> None:
+        # Nothing paired and no model picked: no adverts could ever match, so
+        # BlueZ need not scan; pairing or settings switch it back on.
+        if self._watcher is not None:
+            self._watcher.set_scanning(self._watching())
 
     def stop(self) -> None:
         if self._watcher is not None:
             self._watcher.stop()
             self._watcher = None
+        with self._lock:
+            # The next watcher reads the paired devices afresh.
+            self._paired_known = False
 
     # ---- BlueZ callbacks (main loop) -----------------------------------------------
 
@@ -168,6 +177,7 @@ class AirPodsService(CardService):
             self._paired_known = True
             choice = self._choice
         self.tracker.configure(nearby=self.tracker.nearby, wanted=wanted_models(models, choice))
+        self._update_scanning()
         self._maybe_changed()
 
     def _set_state(self, state: str) -> None:
@@ -325,6 +335,7 @@ class AirPodsService(CardService):
             paired = self._paired
         self.tracker.configure(nearby=settings.nearby,
                                wanted=wanted_models(paired, settings.model))
+        self._update_scanning()
         self.last_activity = self._clock()
         self._maybe_changed(force=True)
 
@@ -342,7 +353,12 @@ class AirPodsService(CardService):
     )
     def GetBatteries(self, sender=None) -> str:
         """JSON, see the README; memory only, answers at once."""
+        before = self.last_activity
         self.admit(sender)
+        if self._watcher is None or not self._watching():
+            # A client polling the batteries keeps a scanning plugin alive,
+            # not one that has nothing to look for.
+            self.last_activity = before
         return json.dumps(self.batteries())
 
     @dbus.service.signal(ACCESSORIES_INTERFACE, signature="")
