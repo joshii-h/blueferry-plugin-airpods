@@ -12,7 +12,6 @@ _DE = {
     "charging": "lädt",
     "in_ear": "im Ohr",
     "lid_open": "Case offen",
-    "just_now": "gerade eben",
     "minutes_ago": "vor {minutes} min",
     "not_nearby": "Nicht in der Nähe – Case in der Nähe dieses Computers öffnen",
     "waiting": "Warte auf ein Signal – Case in der Nähe dieses Computers öffnen",
@@ -36,7 +35,6 @@ _DE = {
     "status_unconfigured": (
         "AirPods mit diesem Computer koppeln oder das Modell in den Einstellungen wählen"
     ),
-    "model_unknown": "unbekanntes Modell",
     "nearby_range": "von {low} bis {high} dBm",
     "settings_unreadable": "Einstellungen nicht lesbar",
     "store_failed": "Einstellungen konnten nicht gespeichert werden: {error}",
@@ -50,7 +48,6 @@ _EN = {
     "charging": "charging",
     "in_ear": "in ear",
     "lid_open": "case open",
-    "just_now": "just now",
     "minutes_ago": "{minutes} min ago",
     "not_nearby": "Not nearby – open the case close to this computer",
     "waiting": "Waiting for a signal – open the case close to this computer",
@@ -72,7 +69,6 @@ _EN = {
     "status_monitoring": "Scanning passively for {models}",
     "status_listening": "Listening only (no advertisement monitor)",
     "status_unconfigured": "Pair your AirPods with this computer or pick the model in the settings",
-    "model_unknown": "unknown model",
     "nearby_range": "from {low} to {high} dBm",
     "settings_unreadable": "Settings unreadable",
     "store_failed": "Could not store the settings: {error}",
