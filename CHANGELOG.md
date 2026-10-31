@@ -2,6 +2,20 @@
 
 All notable changes to blueferry-plugin-airpods.
 
+## Unreleased
+
+- Enabling the plugin again in BlueFerry starts scanning again: a stop
+  now takes the monitor objects off the bus.
+- Switching Bluetooth off and on keeps the monitor; BlueZ's
+  `AlreadyExists` counts as registered. After BlueZ releases the monitor or
+  a registration fails, it registers again after 5 s, doubling up to 5 min.
+- A repeated `DeviceFound` for a known device costs no D-Bus round trip.
+- No scan while there is nothing to look for (nothing paired, no model);
+  new state `idle`. `GetBatteries` keeps only a scanning plugin running.
+- A powered adapter is preferred over one that is off.
+- README: bluetoothd needs `-E` for the monitor; the AirPods 5 ids are
+  marked unconfirmed.
+
 ## 0.1.0 – 2026-10-31
 
 First release, for plugin API 1.5. Not yet tested with AirPods on real

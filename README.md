@@ -28,10 +28,13 @@ the command it will run, and installs only after you confirm. Update with
 `blueferry plugins update io.weirdware.blueferry.airpods`, remove with
 `blueferry plugins remove io.weirdware.blueferry.airpods`.
 
-It needs BlueZ with `org.bluez.AdvertisementMonitorManager1` (BlueZ 5.56 or
-newer; some versions offer it only with bluetoothd's experimental features,
-`-E`; registering was checked on BlueZ 5.87 running with `-E`) and a
-Bluetooth LE adapter. Version 0.1.0 has not been tested with AirPods on real hardware
+It needs a Bluetooth LE adapter and BlueZ with
+`org.bluez.AdvertisementMonitorManager1` (BlueZ 5.56 or newer). In current
+BlueZ (checked: 5.87) `RegisterMonitor` is still an **experimental**
+interface: bluetoothd must run with `-E` (`--experimental`) or with
+`Experimental = true` in `/etc/bluetooth/main.conf`. Without it the plugin
+falls back to "listening" (see below) and the card says so. Registering
+was checked on BlueZ 5.87 running with `-E`. Version 0.1.0 has not been tested with AirPods on real hardware
 yet; see "Test it" below.
 
 ## Configure
@@ -102,8 +105,11 @@ The plugin scans **passively**: it registers an advertisement monitor that
 matches only Apple's proximity advert (AD type 0xFF, bytes `4C 00 07`), and
 BlueZ then listens in the background. It never starts a discovery, never
 connects and never changes adapter settings. While it watches it keeps
-running instead of exiting when idle; when it has nothing to watch (no
-model) it exits after 10 minutes like other plugins. Disabled in BlueFerry,
+running instead of exiting when idle. With nothing to look for (no AirPods
+paired with this computer and no model picked) it does not scan at all, only
+notices a pairing or a new setting, and exits after 10 minutes like other
+plugins; `GetBatteries` calls from other tools do not keep it running then.
+Disabled in BlueFerry,
 it stops scanning, even if another tool starts it over D-Bus. Without the
 monitor manager it falls back to listening only, which sees adverts only
 while another program searches for devices (the card says so).
@@ -130,8 +136,9 @@ On the plugin's own bus name (D-Bus activated, only callable by your user):
 
 `kind` is `earbuds` or `headphones`; headphones (AirPods Max, Beats Solo)
 have `battery` instead of `left`/`right`. Unknown levels are `null`.
-`state` is `monitoring`, `listening`, `starting`, `powered-off`,
-`no-adapter`, `unavailable` or `disabled`. Later versions only add keys.
+`state` is `monitoring`, `listening`, `idle` (nothing to look for, not
+scanning), `starting`, `powered-off`, `no-adapter`, `unavailable` or
+`disabled`. Later versions only add keys.
 
 ```sh
 busctl --user call io.weirdware.BlueFerry.Plugin.io.weirdware.blueferry.airpods \
