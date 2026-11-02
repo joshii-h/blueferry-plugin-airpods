@@ -2,7 +2,9 @@
 
 All notable changes to blueferry-plugin-airpods.
 
-## Unreleased
+## 0.1.0 (2026-11-02)
+
+First release. Tested with AirPods Pro 2 (USB-C) connected to the iPhone: left and right levels on the phone card and in the DMS Device Batteries plugin (the case level was not checked yet).
 
 - Enabling the plugin again in BlueFerry starts scanning again: a stop
   now takes the monitor objects off the bus.
