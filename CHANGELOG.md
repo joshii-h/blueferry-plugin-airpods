@@ -2,6 +2,12 @@
 
 All notable changes to blueferry-plugin-airpods.
 
+## 0.1.1 (2026-11-02)
+
+- Takes `blueferry-plugin-api` 1.6.0 from the official repository
+  (`erikwb/blueferry`) and `blueferry-plugin-kit` 0.4.1. The manifest still
+  declares plugin API 1.5, so nothing changes for BlueFerry.
+
 ## 0.1.0 (2026-11-02)
 
 First release. Tested with AirPods Pro 2 (USB-C) connected to the iPhone: left, right and case levels, charging and the open lid on the phone card and in the DMS Device Batteries plugin.
